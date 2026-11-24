@@ -198,12 +198,12 @@ local function ask_prompt(updating, on_yes, on_no)
     local text
     if updating then
         text = ('A newer version of Detailed Weather\'s optional native drawing hook (%s) is available.\n\n'
-            .. 'Update it now? Choosing No removes the hook and switches to pure Lua; '
-            .. 'you can always run "detailed_weather install" later.'):format(DLL_NAME)
+            .. 'Press Enter to update it now, or Esc to remove the hook and switch to pure Lua '
+            .. '(you can always run "detailed_weather install" later).'):format(DLL_NAME)
     else
         text = ('Detailed Weather includes an optional native drawing hook (%s) for much faster rendering.\n\n'
-            .. 'Install it into Dwarf Fortress\'s folder now? Choosing No keeps Detailed Weather in pure Lua '
-            .. 'and will not ask again (you can always run "detailed_weather install" later).'):format(DLL_NAME)
+            .. 'Press Enter to install it into Dwarf Fortress\'s folder now, or Esc to stay in pure Lua '
+            .. 'and not ask again (you can always run "detailed_weather install" later).'):format(DLL_NAME)
     end
     local ok, err = pcall(function()
         require('gui.dialogs').showYesNoPrompt('Detailed Weather', text, COLOR_WHITE, on_yes, on_no)
