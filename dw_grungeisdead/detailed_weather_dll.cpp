@@ -3022,6 +3022,10 @@ static uint32_t memory_kb() {
 
 static void write_snow() {
     if (!g_plan_ready) return;
+    if (B.drawn_x != g_plan_x || B.drawn_y != g_plan_y || B.drawn_z != g_plan_z) {
+        plan_snow();
+        if (!g_plan_ready) return;
+    }
     g_plan_ready = false;   // one write per plan
     const double t0 = ticks_now();
     take_bakes();
@@ -5147,6 +5151,10 @@ static void fog_put_back() {
 // THE FIX (main thread, in the hook, after the game has drawn)
 static void fix_water_fog() {
     if (!B.fog_enabled || !g_fog_ready || !B.fog_tex_addr || !B.off_interface || !B.off_background) return;
+    if (B.drawn_x != g_fog_x || B.drawn_y != g_fog_y || B.drawn_z != g_fog_z) {
+        plan_fog();
+        if (!g_fog_ready) return;
+    }
     const double t0 = ticks_now();
     int32_t haze[FOG_HAZES];   // the game's hazes, read fresh (a reload of the textures renumbers them)
     const int32_t* src = (const int32_t*)(uintptr_t)B.fog_tex_addr;
@@ -7928,7 +7936,7 @@ DW_EXPORT void dfhooks_init() {
     g_t0_sec = ts.tv_sec;
     g_us_per_tick = 1e-3;
 #endif
-    log_line("Detailed Weather hook DLL, layout %u (test 16A, the wave). DF image base 0x%llX.", LAYOUT,
+    log_line("Detailed Weather hook DLL, layout %u (test 16A, the wave, replan). DF image base 0x%llX.", LAYOUT,
              (unsigned long long)g_base);
 
     // ---- THE BLOCK, PUBLISHED ----
