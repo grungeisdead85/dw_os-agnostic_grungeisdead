@@ -7936,7 +7936,7 @@ DW_EXPORT void dfhooks_init() {
     g_t0_sec = ts.tv_sec;
     g_us_per_tick = 1e-3;
 #endif
-    log_line("Detailed Weather hook DLL, layout %u (test 16A, the wave, replan). DF image base 0x%llX.", LAYOUT,
+    log_line("Detailed Weather hook DLL, layout %u (test 16A, the wave). DF image base 0x%llX.", LAYOUT,
              (unsigned long long)g_base);
 
     // ---- THE BLOCK, PUBLISHED ----
