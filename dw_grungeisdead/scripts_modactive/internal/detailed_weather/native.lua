@@ -297,6 +297,7 @@ end
 local function fill_tiletypes(base)
     local shape, basic, material = df.tiletype_shape, df.tiletype_shape_basic, df.tiletype_material
     local last = math.min(df.tiletype._last_item, TT_TABLE - 1)
+    local tt_a = df.reinterpret_cast('uint8_t', base + OFF.tt_flags)
     local ramps = 0
     for tt = 0, TT_TABLE - 1 do
         local f = 0
@@ -314,7 +315,7 @@ local function fill_tiletypes(base)
             if m == material.GRASS_LIGHT or m == material.GRASS_DARK or m == material.GRASS_DRY
                 or m == material.GRASS_DEAD then f = f | 128 end
         end
-        poke('uint8_t', base + OFF.tt_flags + tt, f)
+        tt_a[tt] = f
     end
     return ramps
 end
@@ -328,6 +329,28 @@ local function any_event(class)
         end
     end
     return nil
+end
+
+-- Fast O(1) vtable and field offsets via DFHack metadata; falls back to any_event if unavailable.
+local function event_info(name, class, fields)
+    local ok_vt, vt, offs = pcall(function()
+        local v = dfhack.internal.getVTable(name)
+        if not v or v == 0 then return nil end
+        local o = {}
+        for _, f in ipairs(fields) do
+            local off = class._fields[f].offset
+            if not off then return nil end
+            o[f] = off
+        end
+        return v, o
+    end)
+    if ok_vt and vt and offs then return vt, offs end
+    local ev = any_event(class)
+    if not ev then return nil end
+    local ebase = addr_of(ev)
+    local o = {}
+    for _, f in ipairs(fields) do o[f] = addr_of(ev:_field(f)) - ebase end
+    return peek('uint64_t', ebase), o
 end
 
 -- snow_ramps.lua's tables (native_tables) into the block.
@@ -346,26 +369,30 @@ end
 
 local function fill_snow_tables(base, t)
     local layout = t.layout
+    local function view(typ, off) return df.reinterpret_cast(typ, base + off) end
     poke('int32_t', base + OFF.edge_level, layout.edge_level)
-    for byte = 0, 255 do poke('int32_t', base + OFF.snow_ramp_tex + byte * 4, t.ramps[byte] or 0) end
+    local ramp_a = view('int32_t', OFF.snow_ramp_tex)
+    for byte = 0, 255 do ramp_a[byte] = t.ramps[byte] or 0 end
+    local ftex_a, fsides_a, fcol_a, fin_a = view('int32_t', OFF.full_tex), view('uint8_t', OFF.full_sides),
+        view('uint8_t', OFF.full_col), view('uint8_t', OFF.full_inside)
     for k, piece in ipairs(t.full) do
         local i = k - 1
         local col = layout.cells[piece.cell]
-        poke('int32_t', base + OFF.full_tex + i * 4, piece.texpos or 0)
-        poke('uint8_t', base + OFF.full_sides + i, piece.sides)
-        poke('uint8_t', base + OFF.full_col + i, col or 255)
-        poke('uint8_t', base + OFF.full_inside + i, layout.inside_cells[piece.cell] and 1 or 0)
+        ftex_a[i] = piece.texpos or 0
+        fsides_a[i] = piece.sides
+        fcol_a[i] = col or 255
+        fin_a[i] = layout.inside_cells[piece.cell] and 1 or 0
     end
+    local pn_a, ptex_a = view('uint8_t', OFF.pieces_n), view('int32_t', OFF.pieces_tex)
     for mask = 0, 15 do
         local list = t.pieces[mask] or {}
-        poke('uint8_t', base + OFF.pieces_n + mask, math.min(#list, 5))
-        for n = 1, 5 do poke('int32_t', base + OFF.pieces_tex + (mask * 5 + n - 1) * 4, list[n] or 0) end
+        pn_a[mask] = math.min(#list, 5)
+        for n = 1, 5 do ptex_a[mask * 5 + n - 1] = list[n] or 0 end
     end
     local page_n = math.min(#t.page, PAGE_MAX)
     poke('int32_t', base + OFF.page_n, page_n)
-    for n = 1, page_n do poke('int32_t', base + OFF.page_tex + (n - 1) * 4, t.page[n]) end
-    -- the textures snow_ramps.lua made, less those handed over in their own tables (the thin sheets
-    -- and snowy ramps): its bakes, which can still be on screen where DF hasn't redrawn since
+    local page_a = view('int32_t', OFF.page_tex)
+    for n = 1, page_n do page_a[n - 1] = t.page[n] end
     local known = {}
     for _, texpos in ipairs(t.thin) do known[texpos] = true end
     for _, texpos in ipairs(t.inside) do known[texpos] = true end
@@ -374,29 +401,33 @@ local function fill_snow_tables(base, t)
     for _, texpos in ipairs(t.made) do if not known[texpos] then bakes[#bakes + 1] = texpos end end
     local made_n = math.min(#bakes, MADE_MAX)
     poke('int32_t', base + OFF.made_n, made_n)
-    for n = 1, made_n do poke('int32_t', base + OFF.made_tex + (n - 1) * 4, bakes[n]) end
-    for n = 1, THIN_N do poke('int32_t', base + OFF.thin_tex + (n - 1) * 4, t.thin[n]) end
-    for n = 1, INSIDE_N do poke('int32_t', base + OFF.inside_tex + (n - 1) * 4, t.inside[n]) end
+    local made_a = view('int32_t', OFF.made_tex)
+    for n = 1, made_n do made_a[n - 1] = bakes[n] end
+    local thin_a, inside_a = view('int32_t', OFF.thin_tex), view('int32_t', OFF.inside_tex)
+    for n = 1, THIN_N do thin_a[n - 1] = t.thin[n] end
+    for n = 1, INSIDE_N do inside_a[n - 1] = t.inside[n] end
     local edge_ids = 0
+    local edge_a = view('int32_t', OFF.edge_art)
     for id = 0, 255 do
         local art = t.edges[id]
         if art then edge_ids = edge_ids + 1 end
         for n, name in ipairs(EDGE_NAMES) do
-            poke('int32_t', base + OFF.edge_art + (id * 8 + n - 1) * 4, art and art[name] or 0)
+            edge_a[id * 8 + n - 1] = art and art[name] or 0
         end
     end
+    local plant_a = view('uint8_t', OFF.plant_edging)
     for plant = 0, PLANTS - 1 do
         local id = t.plant_edging[plant] or 0
-        poke('uint8_t', base + OFF.plant_edging + plant, math.min(id, 255))
+        plant_a[plant] = math.min(id, 255)
     end
-    -- each edge piece's snowy version, baked at start (snow_ramps.lua: SNOWY EDGES AT ONCE)
     local singles = 0
+    local single_a = view('int32_t', OFF.snowy_single)
     for id = 0, 255 do
         local row = t.edges_snowy and t.edges_snowy[id]
         for n, name in ipairs(EDGE_NAMES) do
             local texpos = row and row[name] or 0
             if texpos ~= 0 then singles = singles + 1 end
-            poke('int32_t', base + OFF.snowy_single + (id * 8 + n - 1) * 4, texpos)
+            single_a[id * 8 + n - 1] = texpos
         end
     end
     return {page = page_n, made = made_n, made_all = #bakes, edge_ids = edge_ids, singles = singles, kept = t.edges_kept or 0}
@@ -419,10 +450,12 @@ end
 
 started_note = started_note or nil   -- what the last start found, for the report
 local fill_weather_tt                -- filled in fill_common so draw_shade always has wl_tt
+local common_done_base, common_done_note = nil, nil
 
--- What the snow and the colour both need: the viewports, the view's corner and the map. Filled again
--- by whichever starts (the same values). Returns what it found, in words.
+-- What the snow and the colour both need: the viewports, the view's corner and the map. Filled once
+-- per map load and reused by every subsystem start. Returns what it found, in words.
 local function fill_common(base)
+    if common_done_base == base and common_done_note then return common_done_note end
     local gps = df.global.gps
     local vp = gps.main_viewport
     local map = df.global.world.map
@@ -485,9 +518,11 @@ local function fill_common(base)
     poke('uint32_t', base + OFF.flow_mask, FLOW_BITS)
     local ramp_types = fill_tiletypes(base)
     if fill_weather_tt then fill_weather_tt(base) end
-    return ('%d tiletypes are ramps; hidden bit %d (%s), outside bit %d (%s), subterranean bit %d (%s); map %d x %d blocks, %d levels.')
+    common_done_base = base
+    common_done_note = ('%d tiletypes are ramps; hidden bit %d (%s), outside bit %d (%s), subterranean bit %d (%s); map %d x %d blocks, %d levels.')
         :format(ramp_types, hidden, hidden_how, outside, outside_how, under, under_how,
                 map.x_count_block, map.y_count_block, map.z_count_block)
+    return common_done_note
 end
 
 local function start(base)
@@ -497,9 +532,11 @@ local function start(base)
     if not sr or type(sr.native_tables) ~= 'function' or type(sr.serve_native_bakes) ~= 'function' then
         qerror('snow_ramps.lua has no NATIVE SNOW yet: apply its pairs first')
     end
-    local spatter_ev = any_event(df.block_square_event_material_spatterst)
-    if not spatter_ev then qerror('no material spatter anywhere on this map, so no snow to draw: try a snowy fort') end
-    local grass_ev = any_event(df.block_square_event_grassst)
+    local sp_vt, sp_off = event_info('block_square_event_material_spatterst',
+        df.block_square_event_material_spatterst, {'mat_type', 'mat_state', 'amount'})
+    if not sp_vt then qerror('no material spatter anywhere on this map, so no snow to draw: try a snowy fort') end
+    local gr_vt, gr_off = event_info('block_square_event_grassst',
+        df.block_square_event_grassst, {'plant_index', 'amount'})
 
     -- ---- SNOW_RAMPS.LUA'S TABLES, CHECKED ----
     local tables_from = os.clock()   -- (test 14M: the start timed, for the note)
@@ -525,19 +562,17 @@ local function start(base)
     -- An event's vtable (its first 8 bytes, which is how the DLL tells the
     -- class) and its fields' offsets, read off a live one. The game's snow
     -- is the spatter of WATER as Powder (grass.lua: snow_amount).
-    local ebase = addr_of(spatter_ev)
-    poke('uint64_t', base + OFF.spatter_vtable, peek('uint64_t', ebase))
-    poke('uint32_t', base + OFF.off_ev_mat_type, addr_of(spatter_ev:_field('mat_type')) - ebase)
-    poke('uint32_t', base + OFF.off_ev_mat_state, addr_of(spatter_ev:_field('mat_state')) - ebase)
-    poke('uint32_t', base + OFF.off_ev_amount, addr_of(spatter_ev:_field('amount')) - ebase)
+    poke('uint64_t', base + OFF.spatter_vtable, sp_vt)
+    poke('uint32_t', base + OFF.off_ev_mat_type, sp_off.mat_type)
+    poke('uint32_t', base + OFF.off_ev_mat_state, sp_off.mat_state)
+    poke('uint32_t', base + OFF.off_ev_amount, sp_off.amount)
     poke('int16_t', base + OFF.snow_mat_type, WATER)
     poke('int16_t', base + OFF.snow_mat_state, df.matter_state.Powder)
     poke('int32_t', base + OFF.snowy_from, SNOWY)
-    if grass_ev then
-        local gbase = addr_of(grass_ev)
-        poke('uint64_t', base + OFF.grass_vtable, peek('uint64_t', gbase))
-        poke('uint32_t', base + OFF.off_gev_plant, addr_of(grass_ev:_field('plant_index')) - gbase)
-        poke('uint32_t', base + OFF.off_gev_amount, addr_of(grass_ev:_field('amount')) - gbase)
+    if gr_vt then
+        poke('uint64_t', base + OFF.grass_vtable, gr_vt)
+        poke('uint32_t', base + OFF.off_gev_plant, gr_off.plant_index)
+        poke('uint32_t', base + OFF.off_gev_amount, gr_off.amount)
     else
         poke('uint64_t', base + OFF.grass_vtable, 0)   -- no grass on the map: no grass edges to draw
     end
@@ -1019,12 +1054,12 @@ local function fill_murky_edges(base, g)
         local custom = plant.texpos[5]   -- its CUSTOM_EDGING minus one, or -1 (snow_ramps.lua: native_tables)
         poke('uint8_t', base + OFF.plant_edging + index, math.min(custom >= 0 and custom + 10 or 1, 255))
     end
-    local grass_ev = any_event(df.block_square_event_grassst)
-    if grass_ev then
-        local gbase = addr_of(grass_ev)
-        poke('uint64_t', base + OFF.grass_vtable, peek('uint64_t', gbase))
-        poke('uint32_t', base + OFF.off_gev_plant, addr_of(grass_ev:_field('plant_index')) - gbase)
-        poke('uint32_t', base + OFF.off_gev_amount, addr_of(grass_ev:_field('amount')) - gbase)
+    local gr_vt, gr_off = event_info('block_square_event_grassst',
+        df.block_square_event_grassst, {'plant_index', 'amount'})
+    if gr_vt then
+        poke('uint64_t', base + OFF.grass_vtable, gr_vt)
+        poke('uint32_t', base + OFF.off_gev_plant, gr_off.plant_index)
+        poke('uint32_t', base + OFF.off_gev_amount, gr_off.amount)
     end
 end
 
@@ -1298,12 +1333,12 @@ local function paths_start(base)
     fill_common(base)
     fill_paths_kinds(base)
     -- the grass events' vtable and fields (as murky's corners and the snow read them)
-    local grass_ev = any_event(df.block_square_event_grassst)
-    if grass_ev then
-        local gbase = addr_of(grass_ev)
-        poke('uint64_t', base + OFF.grass_vtable, peek('uint64_t', gbase))
-        poke('uint32_t', base + OFF.off_gev_plant, addr_of(grass_ev:_field('plant_index')) - gbase)
-        poke('uint32_t', base + OFF.off_gev_amount, addr_of(grass_ev:_field('amount')) - gbase)
+    local gr_vt, gr_off = event_info('block_square_event_grassst',
+        df.block_square_event_grassst, {'plant_index', 'amount'})
+    if gr_vt then
+        poke('uint64_t', base + OFF.grass_vtable, gr_vt)
+        poke('uint32_t', base + OFF.off_gev_plant, gr_off.plant_index)
+        poke('uint32_t', base + OFF.off_gev_amount, gr_off.amount)
     end
     poke('uint32_t', base + OFF.paths_depths, PATHS_DEPTH)
     poke('uint64_t', base + OFF.paths_soil_addr, 0)   -- (nothing drawn until the soil is found)
@@ -1921,13 +1956,13 @@ local function crack_start(base)
     poke('uint32_t', base + OFF.off_temperature, addr_of(blk:_field('temperature_1')) - addr_of(blk))
     -- the snow on a tile (grass.lua: snow_amount): as the snow's start reads it, if any spatter is about
     -- yet (the snow's own start fills the same when snow comes)
-    local spatter_ev = any_event(df.block_square_event_material_spatterst)
-    if spatter_ev then
-        local ebase = addr_of(spatter_ev)
-        poke('uint64_t', base + OFF.spatter_vtable, peek('uint64_t', ebase))
-        poke('uint32_t', base + OFF.off_ev_mat_type, addr_of(spatter_ev:_field('mat_type')) - ebase)
-        poke('uint32_t', base + OFF.off_ev_mat_state, addr_of(spatter_ev:_field('mat_state')) - ebase)
-        poke('uint32_t', base + OFF.off_ev_amount, addr_of(spatter_ev:_field('amount')) - ebase)
+    local sp_vt, sp_off = event_info('block_square_event_material_spatterst',
+        df.block_square_event_material_spatterst, {'mat_type', 'mat_state', 'amount'})
+    if sp_vt then
+        poke('uint64_t', base + OFF.spatter_vtable, sp_vt)
+        poke('uint32_t', base + OFF.off_ev_mat_type, sp_off.mat_type)
+        poke('uint32_t', base + OFF.off_ev_mat_state, sp_off.mat_state)
+        poke('uint32_t', base + OFF.off_ev_amount, sp_off.amount)
         poke('int16_t', base + OFF.snow_mat_type, WATER)
         poke('int16_t', base + OFF.snow_mat_state, df.matter_state.Powder)
     end
@@ -2154,6 +2189,7 @@ end
 fill_weather_tt = function(base)
     local shape, material = df.tiletype_shape, df.tiletype_material
     local last = math.min(df.tiletype._last_item, TT_TABLE - 1)
+    local wl_a = df.reinterpret_cast('uint8_t', base + OFF.wl_tt)
     for tt = 0, TT_TABLE - 1 do
         local v = 0
         if tt <= last and df.tiletype[tt] then
@@ -2168,7 +2204,7 @@ fill_weather_tt = function(base)
                 v = v | 8
             end
         end
-        poke('uint8_t', base + OFF.wl_tt + tt, v)
+        wl_a[tt] = v
     end
 end
 
@@ -2674,6 +2710,7 @@ function forget_world()
     local base = block()
     if base then poke('uint32_t', base + OFF.crack_world, (peek('uint32_t', base + OFF.crack_world) + 1) & 0xffffffff) end
     rain_clock = {}   -- (the next map's start timed afresh)
+    common_done_base, common_done_note = nil, nil
     started_note, next_try = nil, 0
     col_note, col_next_try, shade_next_try, fog_next_try = nil, 0, 0, 0
     rain_next_try, crack_next_try = 0, 0
@@ -2696,6 +2733,7 @@ function command(how)
         if leaf_running_now then leaf_hand_back() end
         if spat_running_now then spat_hand_back() end
     elseif how == 'start' then
+        common_done_base, common_done_note = nil, nil
         held, next_try, col_next_try, shade_next_try, murky_next_try, paths_next_try = false, 0, 0, 0, 0, 0
         fog_next_try, rain_next_try, crack_next_try, wfog_next_try, leaf_next_try, spat_next_try = 0, 0, 0, 0, 0, 0
         print('native snow, colour and shade: start on the next frame.')
