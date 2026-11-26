@@ -3764,6 +3764,60 @@ static void swap_colour() {
 static uint8_t* g_dark = nullptr;     // 1 for a covered tile, the view and a tile round it
 static int32_t  g_dark_n = 0;
 
+// Canopy cover per (bx, by, z) block: 1 where z+1..z+SHADE_CANOPY_Z holds a tree canopy tile
+// (wl_tt bit 1: BRANCH, TWIG, TRUNK_BRANCH). Refreshed every SHADE_CANOPY_KEEP frames (a few
+// blocks a frame) so chopping/growing updates within ~1 s without scanning 12 levels per tile.
+struct ShadeCanopy { int32_t bx, by, z; uint32_t used; int64_t made; uint8_t mask[256]; };
+static const int SHADE_CANOPY_Z = 12;
+static const int SHADE_CANOPY_SLOTS = 1024;
+static const int64_t SHADE_CANOPY_KEEP = 60;
+static ShadeCanopy g_shade_canopy[SHADE_CANOPY_SLOTS];
+static int g_shade_canopy_used = 0;
+static void* const* g_shade_xs = nullptr;
+static int32_t g_shade_bxn = 0, g_shade_byn = 0, g_shade_zn = 0;
+
+static void shade_scan_canopy(ShadeCanopy& e) {
+    memset(e.mask, 0, sizeof e.mask);
+    const uint8_t* const wl_tt = B.wl_tt;
+    const int32_t max_dz = (e.z + SHADE_CANOPY_Z < g_map.zn) ? SHADE_CANOPY_Z : (g_map.zn - 1 - e.z);
+    for (int32_t dz = 1; dz <= max_dz; dz++) {
+        const uint8_t* ab = block_ptr(e.bx, e.by, e.z + dz);
+        if (!ab) continue;
+        const uint16_t* at = (const uint16_t*)(ab + B.off_tiletype);
+        for (int i = 0; i < 256; i++) {
+            if (!e.mask[i] && at[i] < TT_TABLE && (wl_tt[at[i]] & 1)) e.mask[i] = 1;
+        }
+    }
+    e.made = B.shade_frames;
+}
+
+static const uint8_t* shade_canopy_for(int32_t bx, int32_t by, int32_t z, int& rechecked) {
+    const uint32_t h = ((uint32_t)bx * 73856093u ^ (uint32_t)by * 19349663u ^ (uint32_t)z * 83492791u) & (SHADE_CANOPY_SLOTS - 1);
+    for (int k = 0; k < 16; k++) {
+        ShadeCanopy& e = g_shade_canopy[(h + k) & (SHADE_CANOPY_SLOTS - 1)];
+        if (e.used && e.bx == bx && e.by == by && e.z == z) {
+            if (B.shade_frames - e.made >= SHADE_CANOPY_KEEP && rechecked < 4) {
+                shade_scan_canopy(e);
+                rechecked++;
+            }
+            return e.mask;
+        }
+        if (!e.used) {
+            if (g_shade_canopy_used >= SHADE_CANOPY_SLOTS * 3 / 4) break;
+            e.used = 1; e.bx = bx; e.by = by; e.z = z;
+            g_shade_canopy_used++;
+            shade_scan_canopy(e);
+            return e.mask;
+        }
+    }
+    memset(g_shade_canopy, 0, sizeof g_shade_canopy);
+    g_shade_canopy_used = 1;
+    ShadeCanopy& e = g_shade_canopy[h];
+    e.used = 1; e.bx = bx; e.by = by; e.z = z;
+    shade_scan_canopy(e);
+    return e.mask;
+}
+
 static void draw_shade() {
     if (!B.shade_enabled || !B.off_designation_layer || !B.have_drawn) return;
     if (!B.main_viewport || !B.block_index || !B.x_count_block || !B.y_count_block || !B.z_count_block ||
@@ -3794,8 +3848,16 @@ static void draw_shade() {
         g_dark_n = g_dark ? W * H : 0;
         if (!g_dark) return;
     }
+    if (B.shade_frames == 0 || g_shade_xs != g_map.xs || g_shade_bxn != g_map.bxn ||
+        g_shade_byn != g_map.byn || g_shade_zn != g_map.zn) {
+        memset(g_shade_canopy, 0, sizeof g_shade_canopy);
+        g_shade_canopy_used = 0;
+        g_shade_xs = g_map.xs; g_shade_bxn = g_map.bxn; g_shade_byn = g_map.byn; g_shade_zn = g_map.zn;
+    }
     const uint32_t open = B.outside_mask | B.subterranean_mask | B.hidden_mask, wet = B.flow_mask;
+    const uint32_t sub_or_hid = B.subterranean_mask | B.hidden_mask;
     const uint8_t* const wl_tt = B.wl_tt;
+    int rechecked = 0;
     bool any = false;
     for (int32_t gx = 0; gx < W; gx++) {
         const int32_t x = x0 + gx;
@@ -3808,15 +3870,21 @@ static void draw_shade() {
             const int32_t end = gy + run < H ? gy + run : H;
             const uint8_t* blk = (y >= 0 && y < g_map.y_end) ? block_ptr(x >> 4, y >> 4, z) : nullptr;
             if (!blk) { memset(col + gy, 0, (size_t)(end - gy)); gy = end; continue; }
+            const uint8_t* canopy = B.off_tiletype ? shade_canopy_for(x >> 4, y >> 4, z, rechecked) : nullptr;
+            const uint8_t* cmask = canopy ? canopy + ((x & 15) << 4) : nullptr;
             const uint32_t* des = (const uint32_t*)(blk + B.off_designation) + ((x & 15) << 4);
             const uint16_t* types = B.off_tiletype ? (const uint16_t*)(blk + B.off_tiletype) + ((x & 15) << 4) : nullptr;
             for (; gy < end; gy++) {
                 const int ly = (y0 + gy) & 15;
                 const uint32_t d = des[ly];
-                // 1 covered (not outside, subterranean, hidden, or frozen ice wall / brook bed: WL_NO_FOG = 8);
+                // 1 covered (above ground, revealed, and either not outside [roof/trunk] or under a tree's
+                // canopy [wl_tt bit 1], unless frozen ice wall / brook bed [wl_tt bit 8]);
                 // 2 liquid (kept apart: only the cell itself is left out for it)
-                const bool no_shade = types && types[ly] < TT_TABLE && (wl_tt[types[ly]] & 8) != 0;
-                const uint8_t c = ((d & open) == 0 && !no_shade) ? 1 : 0;
+                const uint8_t tf = (types && types[ly] < TT_TABLE) ? wl_tt[types[ly]] : 0;
+                const bool no_shade = (tf & 8) != 0;
+                const bool roof_cover = (d & open) == 0;
+                const bool canopy_cover = !roof_cover && (d & sub_or_hid) == 0 && !(tf & 1) && cmask && cmask[ly] != 0;
+                const uint8_t c = ((roof_cover || canopy_cover) && !no_shade) ? 1 : 0;
                 col[gy] = (uint8_t)(c | ((d & wet) ? 2 : 0));
                 any = any || c;
             }

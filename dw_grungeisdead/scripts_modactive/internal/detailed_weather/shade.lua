@@ -90,20 +90,32 @@ end
 -- flags a tile through DFHack, some 800 bridge crossings a block.
 local FLOW_SIZE, HIDDEN, SUBTERRANEAN, OUTSIDE = 7, 1 << 9, 1 << 15, 1 << 16
 local FROZEN, WALL, BROOK_BED = df.tiletype_material.FROZEN_LIQUID, df.tiletype_shape.WALL, df.tiletype_shape.BROOK_BED
-local no_shade_tt = {}
-local designation_copy, tiletype_copy = nil, nil   -- 256 uint32 / uint16: the block being read, made once
-local function read_block(block, now)
+local TREE = df.tiletype_material.TREE
+local BRANCH, TWIG, TRUNK_BRANCH = df.tiletype_shape.BRANCH, df.tiletype_shape.TWIG, df.tiletype_shape.TRUNK_BRANCH
+local SHADE_CANOPY_Z = 12
+local no_shade_tt, canopy_tt = {}, {}
+local designation_copy, tiletype_copy, above_tt_copy = nil, nil, nil   -- 256 uint32 / uint16: the block being read, made once
+local function is_canopy(tt)
+    local c = canopy_tt[tt]
+    if c == nil then
+        local a = df.tiletype.attrs[tt]
+        c = a.material == TREE and (a.shape == BRANCH or a.shape == TWIG or a.shape == TRUNK_BRANCH)
+        canopy_tt[tt] = c
+    end
+    return c
+end
+local function read_block(block, wx, wy, z, now)
     designation_copy = designation_copy or df.new('uint32_t', 256)
     tiletype_copy = tiletype_copy or df.new('uint16_t', 256)
     local _, at = df.sizeof(block:_field('designation'))
     dfhack.internal.memmove(designation_copy, at, 1024)
     local _, tat = df.sizeof(block:_field('tiletype'))
     dfhack.internal.memmove(tiletype_copy, tat, 512)
-    local covered, liquid, any = {}, {}, false
+    local covered, liquid, any, open_cand = {}, {}, false, {}
     for i = 0, 255 do
         local d = designation_copy[i]
-        -- covered: neither outside (open to the sky), underground, hidden, nor frozen ice wall / brook bed
-        if d & (OUTSIDE | SUBTERRANEAN | HIDDEN) == 0 then
+        -- covered: above ground, revealed, and either not outside (roof/trunk) or under a tree's canopy
+        if d & (SUBTERRANEAN | HIDDEN) == 0 then
             local tt = tiletype_copy[i]
             local skip = no_shade_tt[tt]
             if skip == nil then
@@ -112,11 +124,38 @@ local function read_block(block, now)
                 no_shade_tt[tt] = skip
             end
             if not skip then
-                covered[i] = true
-                any = true
+                if d & OUTSIDE == 0 then
+                    covered[i] = true
+                    any = true
+                elseif not is_canopy(tt) then
+                    open_cand[#open_cand + 1] = i
+                end
             end
         end
         if d & FLOW_SIZE ~= 0 then liquid[i] = true end
+    end
+    if #open_cand > 0 then
+        above_tt_copy = above_tt_copy or df.new('uint16_t', 256)
+        for dz = 1, SHADE_CANOPY_Z do
+            local ab = dfhack.maps.getTileBlock(wx, wy, z + dz)
+            if ab then
+                local _, atat = df.sizeof(ab:_field('tiletype'))
+                dfhack.internal.memmove(above_tt_copy, atat, 512)
+                local k = 1
+                while k <= #open_cand do
+                    local i = open_cand[k]
+                    if is_canopy(above_tt_copy[i]) then
+                        covered[i] = true
+                        any = true
+                        open_cand[k] = open_cand[#open_cand]
+                        open_cand[#open_cand] = nil
+                    else
+                        k = k + 1
+                    end
+                end
+                if #open_cand == 0 then break end
+            end
+        end
     end
     return {covered = covered, liquid = liquid, any = any, at = now}
 end
@@ -138,7 +177,7 @@ local function make_plan(viewport, port, now, read_ms)
                 -- a stale block is used as it was until there's time to read it again
                 if dfhack.getTickCount() - started < read_ms then
                     local block = dfhack.maps.getTileBlock(bx * 16, by * 16, z)
-                    if block then b = read_block(block, now) blocks[key] = b end
+                    if block then b = read_block(block, bx * 16, by * 16, z, now) blocks[key] = b end
                 else
                     complete = false
                 end
