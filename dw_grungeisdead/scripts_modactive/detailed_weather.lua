@@ -195,6 +195,11 @@ local FOG_DRIFT_MS = 150                      -- ms between fog drift steps (kee
 marker_layer = marker_layer or nil
 fog_ms = fog_ms or 0   -- running average of the time spent drawing fog, per frame
 scan_ms = scan_ms or {rain = 0, fog = 0}   -- and of the rescans, each time they run
+-- WEATHER FLIPS (grungeisdead's copy, 2026-11-26): each time the weather by block in view changed with the
+-- view still, so the game's own weather changing under it and not a pan: when, how many blocks changed and
+-- of how many, for `detailed_weather details`. Rain or snow coming and going in block-shaped patches with
+-- nothing touched is the game's weather itself when these come often, and something else when they don't.
+weather_flips = weather_flips or {}
 -- Profiling: the whole overlay per frame (running average and worst since last shown), and what
 -- caused each of the slowest frames.
 profile = profile or {average = 0, worst = 0, worst_parts = '', frames = 0, rescans = {}}
@@ -371,6 +376,18 @@ local function weather_key(viewport)
     return table.concat(parts, ',')
 end
 
+-- (WEATHER FLIPS) a change of weather_key with the view still: how many of its blocks changed, kept with
+-- the time for a minute.
+local FLIPS_KEPT_MS = 60000
+local function note_flip(old, new, now)
+    local a, b, n = {}, {}, 0
+    for part in old:gmatch('[^,]+') do a[#a + 1] = part end
+    for part in new:gmatch('[^,]+') do b[#b + 1] = part end
+    for i = 1, math.max(#a, #b) do if a[i] ~= b[i] then n = n + 1 end end
+    weather_flips[#weather_flips + 1] = {at = now, blocks = n, of = #b}
+    while weather_flips[1] and now - weather_flips[1].at > FLIPS_KEPT_MS do table.remove(weather_flips, 1) end
+end
+
 -- RAIN READ IN ONE COPY (grungeisdead's copy, 2026-11-19). A raining block's 16x16 designation flags
 -- (1 KB, column by column as designation[dx][dy], so tile dx * 16 + dy) and tiletypes (512 bytes) are
 -- copied out with one memmove each and the bits tested in Lua, as colour.lua's underground check and
@@ -414,10 +431,16 @@ local function find_rain(viewport)
     for block_y = viewport.y1 - viewport.y1 % 16, viewport.y2, 16 do
         for block_x = viewport.x1 - viewport.x1 % 16, viewport.x2, 16 do
             local block = dfhack.maps.getTileBlock(block_x, block_y, z)
-            local weather = block and weather_at(block_x + 8, block_y + 8, z)
+            -- OPEN SKY WITH NO MAP BLOCK (grungeisdead's copy, 2026-11-26): a block the game hasn't made is open
+            -- sky, every tile outside, not hidden and empty, as find_outdoors takes it. It was skipped whole,
+            -- so no rain or snow fell on it (the DLL's draw_rain had the same rule until its 1.2.5).
+            local sky = not block and dfhack.maps.isValidTilePos(block_x, block_y, z)
+            local weather = (block or sky) and weather_at(block_x + 8, block_y + 8, z)
             if weather then
-                copy_field(block, 'designation', des, 1024)
-                copy_field(block, 'tiletype', types, 512)
+                if block then
+                    copy_field(block, 'designation', des, 1024)
+                    copy_field(block, 'tiletype', types, 512)
+                end
                 local below = dfhack.maps.getTileBlock(block_x, block_y, z - 1)
                 if below then copy_field(below, 'designation', below_des, 1024) end
                 for dx = 0, 15 do
@@ -426,12 +449,12 @@ local function find_rain(viewport)
                         for dy = 0, 15 do
                             local y = block_y + dy
                             local i = dx * 16 + dy
-                            local d = des[i]
+                            local d = block and des[i] or OUTSIDE   -- (no block: open sky)
                             if d & OUTSIDE ~= 0 and d & HIDDEN == 0 and y >= viewport.y1 and y <= viewport.y2 then
                                 local surface = GROUND
                                 if (d & FLOW ~= 0 and d & MAGMA == 0) then
                                     surface = WATER
-                                elseif below and shape_of(types[i]) == EMPTY then
+                                elseif below and (not block or shape_of(types[i]) == EMPTY) then
                                     local b = below_des[i]
                                     if b & FLOW ~= 0 and b & MAGMA == 0 then surface = WATER end
                                 end
@@ -829,7 +852,12 @@ function RainOverlay:draw_weather(dc)
         self.snow_level = precipitation.level('snow', force == 'snow')
         local key = weather_key(viewport)
         -- (NATIVE RAIN: a change asks the DLL's grid for every block again, not only those not kept)
-        if key ~= self.weather_key then self.weather_key, self.due.rain, self.rain_full = key, true, true end
+        if key ~= self.weather_key then
+            -- (WEATHER FLIPS) the same view as at the last rescan: the game's weather changed under it
+            if self.weather_key and self.weather_view == view_key then note_flip(self.weather_key, key, now) end
+            self.weather_key, self.due.rain, self.rain_full = key, true, true
+        end
+        self.weather_view = view_key
         local fog = fog_level()
         if fog ~= self.fog then self.fog, self.due.fog = fog, true end
         if now >= (self.next_ramp_scan or 0) then self.due.ramps = true end
@@ -1054,12 +1082,11 @@ end
 ----------------------------------------------------------------------------------------------
 
 -- The lines themselves come from internal/detailed_weather/tile_info.lua (plant and tree state,
--- grass, snow depth, temperature). They go just under the game's own hover box ('A pile of
--- snow'), which the game draws itself: its place and size aren't exposed, so it's found by
--- reading the screen's text below the top bar (the first block of text rows there is the box).
--- That's a call per cell, so it's looked for a few times a second, not every frame. This is a
--- fullscreen overlay that only writes the cells of its own text: a positioned widget owns its
--- whole frame, and the map isn't drawn under it.
+-- grass, snow depth, temperature). They're worked out again when the mouse moves to another tile,
+-- or every INFO_REFRESH_MS, and drawn every frame in a panel of their own, placed and moved like any
+-- overlay (gui/overlay). (An earlier version found the game's own hover box by reading the screen's
+-- text and wrote under it as a fullscreen overlay.) It shows only over the plain map with nothing
+-- else open (should_hide: ONLY OVER THE PLAIN MAP).
 
 local gui = require('gui')
 local tile_info = reqscript('internal/detailed_weather/tile_info')
@@ -1082,6 +1109,13 @@ TileInfoOverlay.ATTRS{
 
 function TileInfoOverlay:should_hide()
     if not dfhack.isMapLoaded() then return true end
+    -- ONLY OVER THE PLAIN MAP (grungeisdead's copy, 2026-11-26). The panel stayed up as all kinds of
+    -- windows opened (seen in play): the scan below finds only a panel of main_interface with an open flag
+    -- of its own, and not everything that opens over the map is one (DFHack's own windows never are).
+    -- DFHack names what has the screen in its focus strings, and "dwarfmode/Default" is the map with
+    -- nothing else open (the squads panel aside, which the scan finds), so the panel shows only then.
+    -- A DFHack window on top has its own focus ("dfhack/lua/..."), so the panel hides under those too.
+    if not dfhack.gui.matchFocusString('dwarfmode/Default') then return true end
     local interface = df.global.game.main_interface
     if interface.hover_announcement_alert or interface.current_hover_alert then return true end
     if not self.panels then
@@ -1381,6 +1415,13 @@ local function show_details()
         dfhack.isMapLoaded() and df.fog_type[fort_world_tile().clouds.fog] or '-',
         native.wfog_running() and 'drawn by the hook DLL (detailed_weather native)' or ('drawing %.2f ms a frame'):format(module.fog_ms)))
     print(('  rescans (4 a second): rain %.1f ms, fog %.1f ms'):format(module.scan_ms.rain, module.scan_ms.fog))
+    -- (WEATHER FLIPS) the game's weather changing under a still view, the last minute
+    local flip_now, flips, flipped, of, last = dfhack.getTickCount(), 0, 0, 0, nil
+    for _, f in ipairs(module.weather_flips) do
+        if flip_now - f.at <= 60000 then flips, flipped, of, last = flips + 1, flipped + f.blocks, f.of, f.at end
+    end
+    print(('  the weather by block in view changed %d times in the last minute with the view still (%d block changes, of %d blocks in view)%s')
+        :format(flips, flipped, of, last and (', the last %.0f s ago'):format((flip_now - last) / 1000) or ''))
     print('  colour: ' .. colour.describe())
     print('  shade ' .. shade.describe())
     print('  spatter in the grass ' .. spatter.describe())

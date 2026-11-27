@@ -288,6 +288,19 @@
 //     write_snow and a plan_fog() to fix_water_fog for a view that had moved, on the main thread, which
 //     could never run (the view's corner is read in the prerender call only) and would have read the
 //     map off the game thread if it had.
+//   1.2.5 (still layout 38, 2026-11-26): OPEN SKY WITH NO MAP BLOCK. DF leaves a block of open air
+//     above the ground unmade until something needs it (DFHack's ensureTileBlock makes one only when
+//     asked; detailed_weather.lua's find_outdoors and THE FOG here already took a missing block as
+//     open sky). Everything else here took one as nothing at all: the rain and snow falling skipped
+//     it whole, the snow's walk, FOG OVER WATER's walk and the murky tint stopped at it as at solid
+//     ground, the cracks and the paths took it as not seen through. So with the view a level or more
+//     above ground no tree reaches, whole blocks went without their falling snow while the hover box,
+//     reading the ground's weather below, called them snowing (seen in play 2026-11-26: a rectangle
+//     with no snowfall over several depths, filled in a level down), and the ground below them went
+//     without its snow, cracks and tint. Each now takes a missing block as open air: outside, not
+//     hidden, nothing in it. And the rain's list of cells to put back can no longer fill: entries for
+//     the buffers about to be written are put back first, and the list grows to what a frame needs (in
+//     play it had filled, 15,420 cells left without their tile).
 //
 //
 // WHY NATIVE: the Lua version redraws thousands of tiles over the game's
@@ -2585,7 +2598,10 @@ static void walk_view(int slots, int64_t& columns, int64_t& snowy_floors) {
                     last_bare[d] = c && !snow_near(*c);   // (NO SNOW NEAR: no kept rules, no fingerprints)
                     last_memo[d] = c && !last_bare[d] ? memo_for(*c) : nullptr;
                 }
-                if (!c) break;
+                // OPEN SKY WITH NO MAP BLOCK (1.2.5): nothing on this level to draw, and the levels below
+                // show through it as through open air (bare_walk's A_ON). Until 1.2.5 the walk stopped here,
+                // as at solid ground, and the ground below went without its snow.
+                if (!c) continue;
                 if (last_bare[d]) {
                     if (bare_walk(*c, t) != A_ON) break;
                     continue;
@@ -4957,7 +4973,18 @@ static void draw_murky() {
                 const int32_t y = B.drawn_y + sy;
                 const int32_t run = y >= 0 ? 16 - (y & 15) : 1;
                 const int32_t end = sy + run < dy ? sy + run : dy;
-                const uint8_t* blk = (y >= 0 && y < g_map.y_end) ? block_ptr(x >> 4, y >> 4, z) : nullptr;
+                const bool row_on_map = y >= 0 && y < g_map.y_end;
+                const uint8_t* blk = row_on_map ? block_ptr(x >> 4, y >> 4, z) : nullptr;
+                if (!blk && row_on_map) {
+                    // OPEN SKY WITH NO MAP BLOCK (1.2.5): no water here, and the levels below show through it
+                    // as through open air: each cell still seeing down goes on (Until 1.2.5: seen no further.)
+                    for (int32_t s = sy; s < end; s++) {
+                        uint8_t& see = g_murky_see[(size_t)sx * dy + s];
+                        if (see) { see = (uint8_t)(see & ~SEE_BRANCH_LAST); any_open = true; }
+                    }
+                    sy = end;
+                    continue;
+                }
                 if (!blk) { memset(g_murky_see + (size_t)sx * dy + sy, 0, (size_t)(end - sy)); sy = end; continue; }
                 const uint32_t* des = (const uint32_t*)(blk + B.off_designation) + ((x & 15) << 4);
                 const uint16_t* types = (const uint16_t*)(blk + B.off_tiletype) + ((x & 15) << 4);
@@ -5128,7 +5155,14 @@ static void fog_walk_block(FogBlock& e) {
         const int32_t z = e.z - d;
         if (z < 0 || z >= g_map.zn) break;
         const uint8_t* blk = block_ptr(e.bx, e.by, z);
-        if (!blk) break;   // (no block on this level: nothing further down shows)
+        if (!blk) {
+            // OPEN SKY WITH NO MAP BLOCK (1.2.5): every tile still walking goes on down through it, its
+            // last level open space. (Until 1.2.5 the walk stopped here: "nothing further down shows".)
+            bool walking = false;
+            for (int t = 0; t < 256; t++) if (walk[t]) { walk[t] = 1; walking = true; }
+            if (!walking) break;
+            continue;
+        }
         const uint32_t* des = (const uint32_t*)(blk + B.off_designation);
         const uint16_t* types = (const uint16_t*)(blk + B.off_tiletype);
         bool walking = false;
@@ -5928,7 +5962,8 @@ static int32_t p_bake(uint64_t addr, uint64_t key, double deadline, int& why) {
 static bool p_shows(int32_t x, int32_t y, int32_t z) {
     for (int32_t zz = B.drawn_z; zz > z; zz--) {
         const uint8_t* blk = block_ptr(x >> 4, y >> 4, zz);
-        if (!blk || !(flags_of(((const uint16_t*)(blk + B.off_tiletype))[tile_of(x, y)]) & TT_OPEN)) return false;
+        if (!blk) continue;   // (OPEN SKY WITH NO MAP BLOCK, 1.2.5: open air; until 1.2.5 taken as not seen through)
+        if (!(flags_of(((const uint16_t*)(blk + B.off_tiletype))[tile_of(x, y)]) & TT_OPEN)) return false;
     }
     return true;
 }
@@ -6341,13 +6376,30 @@ static void draw_rain() {
     int32_t* const ts = B.off_top_shadow ? *(int32_t* const*)(main + B.off_top_shadow) : nullptr;
     if (!hf) return;
     const int32_t n = dx * dy;
-    // the list to put back: room for two frames of a whole view, dropped at a new size (new buffers)
+    // the list to put back, dropped at a new size (new buffers)
     if (dx != g_rain_kept_dx || dy != g_rain_kept_dy) { g_rain_kept_n = 0; g_rain_kept_dx = dx; g_rain_kept_dy = dy; }
-    if (g_rain_kept_cap < 2 * n) {
-        RainKept* more = (RainKept*)realloc(g_rain_kept, sizeof(RainKept) * (size_t)(2 * n));
+    // THE LIST (1.2.5): entries left for the buffers about to be written are put back first. The prerender
+    // call has put them back in every frame DF draws; any still here are from a write into these same
+    // buffers with no put back between, and kept, the list would hold a cell twice and the next write
+    // would find its game value to be this hook's tile. Then room for this frame's whole view on top of
+    // what's left (the other buffer's), so no cell is ever left without its tile for want of room: until
+    // 1.2.5 the list held two whole views at most, and in play it filled (15,420 cells left).
+    {
+        int32_t w = 0;
+        for (int32_t k = 0; k < g_rain_kept_n; k++) {
+            const RainKept e = g_rain_kept[k];
+            if (e.arr == hf || (ts && e.arr == ts)) {
+                if (e.arr[e.index] == e.ours) e.arr[e.index] = e.game;
+            } else g_rain_kept[w++] = e;
+        }
+        g_rain_kept_n = w;
+    }
+    if (g_rain_kept_cap < g_rain_kept_n + n) {
+        const int32_t want = g_rain_kept_n + n > 2 * n ? g_rain_kept_n + n : 2 * n;
+        RainKept* more = (RainKept*)realloc(g_rain_kept, sizeof(RainKept) * (size_t)want);
         if (!more) return;
         g_rain_kept = more;
-        g_rain_kept_cap = 2 * n;
+        g_rain_kept_cap = want;
     }
     // ---- THE PATCH: each column's and row's place on the repeat, once (both sheets alike when their
     // cells agree; else worked out per kind below) ----
@@ -6384,15 +6436,19 @@ static void draw_rain() {
             if (y < 0 || y >= g_map.y_end) { sy = end; continue; }
             const int32_t by = y >> 4, gy = by - wby;
             const uint8_t weather = (gy >= 0 && gy < wny) ? B.rain_weather[gx * wny + gy] : 0;
-            const uint8_t* const blk = weather ? block_ptr(bx, by, z) : nullptr;
-            if (!blk || (weather == 1 && !rain_ok) || (weather == 2 && !snow_ok) || weather > 2) { sy = end; continue; }
-            const uint32_t* const des = (const uint32_t*)(blk + B.off_designation) + ((x & 15) << 4);
-            const uint16_t* const types = (const uint16_t*)(blk + B.off_tiletype) + ((x & 15) << 4);
+            if (!weather || (weather == 1 && !rain_ok) || (weather == 2 && !snow_ok) || weather > 2) { sy = end; continue; }
+            // OPEN SKY WITH NO MAP BLOCK (1.2.5): a block DF hasn't made is open sky, every tile outside, not
+            // hidden and empty, as THE FOG takes it; it rains or snows on all of it. Until 1.2.5 it was
+            // skipped whole (as detailed_weather.lua's find_rain skipped it before): no snowfall over a
+            // block-shaped stretch that the hover box called snowing, filled in a level down.
+            const uint8_t* const blk = block_ptr(bx, by, z);
+            const uint32_t* const des = blk ? (const uint32_t*)(blk + B.off_designation) + ((x & 15) << 4) : nullptr;
+            const uint16_t* const types = blk ? (const uint16_t*)(blk + B.off_tiletype) + ((x & 15) << 4) : nullptr;
             const uint8_t* const below = (weather == 1 && z > 0) ? block_ptr(bx, by, z - 1) : nullptr;
             const uint32_t* const bdes = below ? (const uint32_t*)(below + B.off_designation) + ((x & 15) << 4) : nullptr;
             for (; sy < end; sy++) {
                 const int ly = (B.drawn_y + sy) & 15;
-                const uint32_t d = des[ly];
+                const uint32_t d = des ? des[ly] : outside;   // (no block: open sky, outside, nothing in it)
                 if (!(d & outside) || (d & hidden)) continue;
                 falling++;
                 // the sheet tile (rain_tile, snow_tile)
@@ -6405,8 +6461,9 @@ static void draw_rain() {
                 } else {
                     // WATER: liquid that isn't magma here, or open space over such liquid just below
                     bool water = (d & flow) && !(d & magma);
-                    const uint16_t tt = types[ly];
-                    if (!water && bdes && tt < TT_TABLE && B.tt_empty[tt]) {
+                    // (open space: shape EMPTY, or no block at all)
+                    const bool empty = !types || (types[ly] < TT_TABLE && B.tt_empty[types[ly]]);
+                    if (!water && bdes && empty) {
                         const uint32_t b = bdes[ly];
                         water = (b & flow) && !(b & magma);
                     }
@@ -6530,7 +6587,9 @@ static void crack_work_block(CrackCodes* c, int32_t bx, int32_t by, int32_t z) {
     g_crack_worked++;
     B.crack_blocks_worked++;
     const uint8_t* blk = block_ptr(bx, by, z);
-    if (!blk) { memset(c->code, 0, sizeof c->code); return; }
+    // OPEN SKY WITH NO MAP BLOCK (1.2.5): every tile open space, so a floor below is seen through it.
+    // (Until 1.2.5 all 0: a floor below such a block never cracked.)
+    if (!blk) { memset(c->code, CRACK_OPEN, sizeof c->code); return; }
     // the snow on each tile (grass.lua: snow_amount: the most of any powder WATER spatter)
     uint8_t snow[256];
     memset(snow, 0, sizeof snow);
