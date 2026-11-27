@@ -314,6 +314,12 @@
 //     showings in 20 seconds of zooming (2026-11-27), and fallen fruit and leaves were seen flickering
 //     in and out under trees the same day, which this can do. Now a renderer call with no prerender
 //     call since the last one leaves the buffers as they are: they already hold everything drawn here.
+//   1.2.8 (still layout 38, 2026-11-27): BLADES UNDER BUILDINGS. THE SPATTER DRAWN HERE puts the grass's
+//     blades over spatter on grass in the item layer, so they stand in front of it, and DF draws the item
+//     layer over its first building layer (a workshop's own picture: items lie on top of workshops). A
+//     workshop built on grass keeps the grass under it, and wherever spatter lay on that grass the blades
+//     were drawn over the workshop: grass growing through workshops, seen in play the same day. Now a
+//     cell with anything in either building layer gets no blades.
 //
 //
 // WHY NATIVE: the Lua version redraws thousands of tiles over the game's
@@ -7906,6 +7912,9 @@ static void draw_spatter() {
     int32_t* const spat = *(int32_t* const*)(main + B.off_spatter);
     int32_t* const bg = *(int32_t* const*)(main + B.off_background);
     int32_t* const items = *(int32_t* const*)(main + B.off_item);
+    // BLADES UNDER BUILDINGS (1.2.8): the two building layers, read to keep the blades off a building's cells
+    const int32_t* const build1 = B.off_building_one ? *(const int32_t* const*)(main + B.off_building_one) : nullptr;
+    const int32_t* const build2 = B.off_building_two ? *(const int32_t* const*)(main + B.off_building_two) : nullptr;
     if (!spat || !bg || !items || !kept_ready(g_spat_kept, dx, dy) || !kept_ready(g_blade_kept, dx, dy)) return;
     const bool blades_on = B.spat_blades != 0;
     const bool amounts_ok = B.spat_vtable && B.off_isp_amount && g_map.bxn == g_leaf_bxn && g_map.byn == g_leaf_byn && g_map.zn == g_leaf_zn;
@@ -7969,8 +7978,9 @@ static void draw_spatter() {
                     } else full++;
                 } else waiting++;
             }
-            // the grass's blades over it, unless an item has the layer
-            if (blades_on && items[i] == 0) {
+            // the grass's blades over it, unless an item has the layer or a building stands there (BLADES
+            // UNDER BUILDINGS: the item layer is drawn over a building's, so blades there showed through it)
+            if (blades_on && items[i] == 0 && !(build1 && build1[i]) && !(build2 && build2[i])) {
                 const uint64_t gpic = crack_picture(ground), gopic = gorig == ground ? gpic : crack_picture(gorig);
                 if (gpic && gopic) {
                     SpatBake* e = spat_bake_find(gpic, gopic, 0x20000u, true);
@@ -8151,7 +8161,7 @@ DW_EXPORT void dfhooks_init() {
     g_t0_sec = ts.tv_sec;
     g_us_per_tick = 1e-3;
 #endif
-    log_line("Detailed Weather hook DLL, layout %u (test 16A, the wave). DF image base 0x%llX.", LAYOUT,
+    log_line("Detailed Weather hook DLL 1.2.8, layout %u (test 16A, the wave). DF image base 0x%llX.", LAYOUT,
              (unsigned long long)g_base);
 
     // ---- THE BLOCK, PUBLISHED ----
