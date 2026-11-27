@@ -280,6 +280,14 @@
 //     rules here: Lua hands over each grass picture's lean frames and rustle frames (in slots), the
 //     gusts' lean as it keeps it (lean_history), and each frame's numbers; rustle frames not made yet
 //     are asked of Lua, which sends each as a PJ_RUSTLE job.
+//   1.2.4 (still layout 38, 2026-11-26): NOTHING TO DRAW, NOTHING MOVED. With no snow anywhere the
+//     snow's walk still read every screen column and block in view, every frame: 647 to 670 us a frame in
+//     play (`detailed_weather native`), on the game thread. It is skipped while its last walk found
+//     nothing, the view stands still and no snow is falling, and walked again on any change and every
+//     QUIET_WALK_FRAMES frames. And no plan is made in the hook any more: 1.2.1 added a plan_snow() to
+//     write_snow and a plan_fog() to fix_water_fog for a view that had moved, on the main thread, which
+//     could never run (the view's corner is read in the prerender call only) and would have read the
+//     map off the game thread if it had.
 //
 //
 // WHY NATIVE: the Lua version redraws thousands of tiles over the game's
@@ -2599,9 +2607,47 @@ static void walk_view(int slots, int64_t& columns, int64_t& snowy_floors) {
     }
 }
 
+// ---- NOTHING TO DRAW, NOTHING MOVED (1.2.4, 2026-11-26) ----
+// The walk reads every screen column down through every level DF shows, and
+// every block it passes (the snow on each of its 256 tiles, from the block's
+// events), whether or not there's a flake anywhere. MEASURED in play
+// (2026-11-26, `detailed_weather native`, no snow on the map): 647 to 670 us
+// a frame on average, worst 1780, over 8,160 columns and 637 to 702 blocks,
+// on the game thread (this runs in the prerender call, inside render_things,
+// between the game's ticks). Since 1.2.1 the walk also goes on down through
+// branches and leaves (bare_walk: DF shows the levels below them), so under
+// trees it reads more levels than before.
+// So when the last full walk made no record (no snow wherever it looked),
+// the view hasn't moved (its corner and level, the viewports DF shows and
+// their size, the map's size) and no snow is falling in the weather Lua
+// hands over (RAIN AND SNOW FALLING), the walk is skipped: nothing would be
+// drawn, as nothing was. It is walked in full again as soon as any of those
+// changes, and every QUIET_WALK_FRAMES frames regardless, for snow that came
+// some other way. Snow lies only where it fell, so while none falls and none
+// is in view there is none to find; once it falls, every frame is walked as
+// before. (Offline, check/quiet.cpp: the screen frame for frame the same as
+// without the skip through snowfall, a thaw, a pan, a change of level and a
+// zoom; snow that appears with none falling is drawn within the frames
+// allowed.)
+static const int QUIET_WALK_FRAMES = 30;
+struct QuietWalk { bool valid, bare; int32_t x, y, z, slots, dx, dy, bxn, byn, zn; int frames; };
+static QuietWalk g_quiet = {};
+
+// Whether snow is falling on any block of the weather grid Lua hands over
+// (RAIN AND SNOW FALLING: 2 is snow). Entries outside the grid in use may
+// still hold an older grid's: one read as snow only costs a full walk.
+static bool snow_falling() {
+    if (!B.rain_weather_any) return false;
+    return memchr(B.rain_weather, 2, sizeof B.rain_weather) != nullptr;
+}
+
 static void plan_snow() {
     g_plan_ready = false;
     g_rec_n = 0;
+    // (NOTHING TO DRAW, NOTHING MOVED: kept only by a full walk or a skip, below, so a frame that stops
+    // short, snow off, a map not drawn yet or unloading, walks in full next time)
+    const QuietWalk last = g_quiet;
+    g_quiet.valid = false;
     if (!B.enabled || !B.hooked || !B.have_drawn || !B.tables_built) return;
     if (!B.main_viewport || !B.block_index || !B.x_count_block || !B.y_count_block ||
         !B.z_count_block || !B.spatter_vtable || !B.off_dim_x || !B.off_dim_y ||
@@ -2635,6 +2681,25 @@ static void plan_snow() {
     for (int s = slots; s < SLOTS; s++) g_sb[s].usable = false;
     if (!slots) return;
 
+    // ---- NOTHING TO DRAW, NOTHING MOVED (above) ----
+    const QuietWalk& q = last;
+    if (q.valid && q.bare && q.frames < QUIET_WALK_FRAMES && q.x == wx && q.y == wy && q.z == wz &&
+        q.slots == slots && q.dx == g_sb[0].dx && q.dy == g_sb[0].dy &&
+        q.bxn == g_map.bxn && q.byn == g_map.byn && q.zn == g_map.zn && !snow_falling()) {
+        g_quiet = last;
+        g_quiet.frames++;
+        const double us = (ticks_now() - t0) * g_us_per_tick;
+        B.plans++;              // (a frame worked out, to nothing: the average shows the saving)
+        B.columns_last = 0;     // (`detailed_weather native`: "the last walked 0 screen columns" is a skipped walk)
+        B.records_last = 0;
+        B.snowy_last = 0;
+        B.blocks_last = 0;
+        B.plan_us_total += us;
+        if (us > B.plan_us_max) B.plan_us_max = us;
+        g_plan_ready = true;    // (no records: write_snow writes nothing, as after the last walk)
+        return;
+    }
+
     int64_t columns = 0, snowy_floors = 0;
     walk_view(slots, columns, snowy_floors);
 
@@ -2649,6 +2714,7 @@ static void plan_snow() {
     B.plan_us_total += us;
     if (us > B.plan_us_max) B.plan_us_max = us;
     g_plan_ready = true;
+    g_quiet = {true, g_rec_n == 0, wx, wy, wz, slots, g_sb[0].dx, g_sb[0].dy, g_map.bxn, g_map.byn, g_map.zn, 0};
 }
 
 // =====================================================================
@@ -3022,10 +3088,11 @@ static uint32_t memory_kb() {
 
 static void write_snow() {
     if (!g_plan_ready) return;
-    if (B.drawn_x != g_plan_x || B.drawn_y != g_plan_y || B.drawn_z != g_plan_z) {
-        plan_snow();
-        if (!g_plan_ready) return;
-    }
+    // (1.2.4) No plan is made here. This runs in the hook, on the main thread, after DF has drawn, and a
+    // plan reads the map, which only the game thread changes and unloads (PLAN AND WRITE, at the top).
+    // The view's corner is read in the prerender call only, and the two calls alternate strictly, so it
+    // cannot have moved since this frame's plan: the plan_snow() 1.2.1 to 1.2.3 made here on a change of
+    // corner could never run, and would have read the map off the game thread if it had.
     g_plan_ready = false;   // one write per plan
     const double t0 = ticks_now();
     take_bakes();
@@ -5219,10 +5286,8 @@ static void fog_put_back() {
 // THE FIX (main thread, in the hook, after the game has drawn)
 static void fix_water_fog() {
     if (!B.fog_enabled || !g_fog_ready || !B.fog_tex_addr || !B.off_interface || !B.off_background) return;
-    if (B.drawn_x != g_fog_x || B.drawn_y != g_fog_y || B.drawn_z != g_fog_z) {
-        plan_fog();
-        if (!g_fog_ready) return;
-    }
+    // (1.2.4) No plan here either, for the same reason as write_snow's: the main thread never reads the
+    // map. A view other than the one planned is left as DF drew it, just below.
     const double t0 = ticks_now();
     int32_t haze[FOG_HAZES];   // the game's hazes, read fresh (a reload of the textures renumbers them)
     const int32_t* src = (const int32_t*)(uintptr_t)B.fog_tex_addr;
