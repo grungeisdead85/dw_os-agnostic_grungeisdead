@@ -52,6 +52,10 @@ local TICKS_PER_YEAR = 403200
 
 forced = forced or {}    -- `detailed_weather rain N` / `snow N`: a level for each, for testing
 spell = spell or nil     -- the spell of rain or snow now: {started =, dry_since =} in game ticks
+-- DRY A MOMENT (1.2.7, at spell_ticks): what describe reports, since the fort loaded. changes: the
+-- level the overlay asked for differed from its last; dry: a spell's samples found nothing falling
+-- (each start of a dry moment); ended: a spell over, dry past the gap; last: the level by kind.
+level_watch = level_watch or {changes = 0, dry = 0, ended = 0, last = {}}
 
 -- THE SPELL SAVED (grungeisdead's copy, 2026-11-20). The spell lived only in this script, so a fort
 -- loaded in the rain started again at drizzle and built up a level a game day (in play: no rain seen
@@ -148,14 +152,33 @@ end
 -- How long it has been raining or snowing on the map, in game ticks (0 when it isn't). A spell
 -- ends once the map has been seen dry for SPELL_GAP_TICKS; time nobody was looking (the overlay
 -- isn't drawn behind a full-screen menu) counts as part of the spell if it's still falling after.
+--
+-- DRY A MOMENT (1.2.7). A spell whose samples find nothing falling for less than SPELL_GAP_TICKS is
+-- still carrying on (rain back within the gap is the same spell, below), so its age holds while it
+-- waits, and the level with it. Until 1.2.7 the first dry sample returned 0 here: the level fell to
+-- drizzle (built: LIGHTEST) until a sample found rain again, RECHECK_TICKS later at the soonest, and
+-- the falling sheet went to drizzle's and back, a blink of the rain each time (drizzle has something
+-- drawn in 26% of its tiles, steady rain in 65%). Seen in play 2026-11-27: the rain flickering on and
+-- off through a spell 25 days long, the weather in view unchanged for a minute at a time, and 84 rain
+-- sheet loads in it (a load comes with a change of sheet; the wind was calm, so never of slant).
 local function spell_ticks()
     if not spell_loaded then load_spell() end   -- (THE SPELL SAVED)
     local now = now_ticks()
     if not falling() then
-        if spell and not spell.dry_since then spell.dry_since = now save_spell() end
+        if spell and not spell.dry_since then
+            spell.dry_since = now
+            save_spell()
+            level_watch.dry = level_watch.dry + 1
+        end
+        -- DRY A MOMENT: within the gap, the spell's age as if it were still falling
+        if spell and spell.dry_since and now >= spell.started and now >= spell.dry_since
+                and now - spell.dry_since <= SPELL_GAP_TICKS then
+            return now - spell.started
+        end
         return 0
     end
     local ended = spell and spell.dry_since and now - spell.dry_since > SPELL_GAP_TICKS
+    if ended then level_watch.ended = level_watch.ended + 1 end
     if not spell or ended or now < spell.started then
         spell = {started = now}
         save_spell()
@@ -180,17 +203,31 @@ function level(kind, full_strength)
         wanted = (thick or cells >= MOST_CELLS) and HARDEST or wanted + 1
     end
     local built = full_strength and HARDEST or LIGHTEST + spell_ticks() // BUILD_TICKS
-    return math.min(wanted, built, HARDEST)
+    local result = math.min(wanted, built, HARDEST)
+    -- DRY A MOMENT: a change of level counted (the overlay's and hover box's asking, not a forced one)
+    if kind and not full_strength then
+        local was = level_watch.last[kind]
+        if was and was ~= result then level_watch.changes = level_watch.changes + 1 end
+        level_watch.last[kind] = result
+    end
+    return result
 end
 
--- A world unloading: the next fort's spell is read from its own data (THE SPELL SAVED).
-function forget() spell, spell_loaded = nil, false end
+-- A world unloading: the next fort's spell is read from its own data (THE SPELL SAVED), and the
+-- counts start again (DRY A MOMENT).
+function forget()
+    spell, spell_loaded = nil, false
+    level_watch = {changes = 0, dry = 0, ended = 0, last = {}}
+end
 
 function describe()
     local _, _, strength = wind.get()
     local forced_note = (forced.rain and (', rain forced to ' .. forced.rain) or '')
         .. (forced.snow and (', snow forced to ' .. forced.snow) or '')
-    return ('level %d%s (%d of 25 weather cells falling, thick cloud %s, wind %.2f, falling for %.1f days)'):format(
+    return ('level %d%s (%d of 25 weather cells falling, thick cloud %s, wind %.2f, falling for %.1f days);'
+        .. ' since the fort loaded: %d changes of level, %d dry moments in a spell, %d spells ended dry'
+        .. ' (DRY A MOMENT)'):format(
         level(), forced_note, falling_cells(), thick_cloud() and 'yes' or 'no', strength,
-        (dfhack.isMapLoaded() and spell_ticks() or 0) / 1200)
+        (dfhack.isMapLoaded() and spell_ticks() or 0) / 1200,
+        level_watch.changes, level_watch.dry, level_watch.ended)
 end

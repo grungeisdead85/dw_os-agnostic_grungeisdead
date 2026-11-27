@@ -301,6 +301,19 @@
 //     hidden, nothing in it. And the rain's list of cells to put back can no longer fill: entries for
 //     the buffers about to be written are put back first, and the list grows to what a frame needs (in
 //     play it had filled, 15,420 cells left without their tile).
+//   1.2.6 (still layout 38, 2026-11-27): THE SAME FRAME SHOWN AGAIN. DF shows a frame (this renderer
+//     call, then display) every graphics frame, but draws a new one (swap_arrays, the prerender call,
+//     the game's drawing, DFHack's overlays) only when the game has asked for one (g_src enabler.cpp:
+//     async_loop obeys the render command only with ENABLERFLAG_RENDER set; do_frame displays either
+//     way). So this hook ran again over buffers that nothing had put back or redrawn since its last run,
+//     and read its own writes back as the game's drawing. The spatter's bakes aren't marked as its own,
+//     so a second run baked a bake again (thinned and shadowed twice) and listed it to put back as the
+//     game's spatter; put back in the order written, the first entry no longer matched and the second
+//     restored the first bake as the game's, left wherever DF didn't redraw the cell. The snow's write
+//     and the rest read their own writes the same way. stone-tint's trace counted 14 and 22 such
+//     showings in 20 seconds of zooming (2026-11-27), and fallen fruit and leaves were seen flickering
+//     in and out under trees the same day, which this can do. Now a renderer call with no prerender
+//     call since the last one leaves the buffers as they are: they already hold everything drawn here.
 //
 //
 // WHY NATIVE: the Lua version redraws thousands of tiles over the game's
@@ -7998,8 +8011,18 @@ static void draw_spatter() {
     if (paint_us > B.spat_paint_us_max) B.spat_paint_us_max = paint_us;
 }
 
+// THE SAME FRAME SHOWN AGAIN (1.2.6): B.prerender_calls at the last renderer call that drew here, so a
+// renderer call with no new frame drawn since (no prerender call between) is told apart.
+static int64_t g_tidy_drawn_at = -1;
+
 static void tidy_hook(void* self) {
     B.tidy_calls++;
+    // THE SAME FRAME SHOWN AGAIN (1.2.6): no prerender call since the last renderer call means DF drew
+    // no new frame (render_things wasn't run: nothing swapped, put back or redrawn), so the buffers
+    // still hold everything drawn here last time. Working them again would read those writes back as
+    // the game's drawing (the version history has what that did), so they're shown as they are.
+    if (B.prerender_calls == g_tidy_drawn_at) { g_tidy_original(self); return; }
+    g_tidy_drawn_at = B.prerender_calls;
     if (B.enabled && B.have_drawn && B.window_x && B.window_y) {
         int32_t live_x = *(const int32_t*)(uintptr_t)B.window_x;
         int32_t live_y = *(const int32_t*)(uintptr_t)B.window_y;
